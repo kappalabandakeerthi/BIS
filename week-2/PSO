@@ -1,0 +1,142 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- Problem Formulation Configuration ---
+START = np.array([0.0, 0.0])
+END = np.array([10.0, 10.0])
+NUM_WAYPOINTS = 8  # Number of internal nodes to optimize along the path
+
+# Obstacles defined as: (x_center, y_center, radius)
+OBSTACLES = [
+    (5.0, 5.0, 2.0),
+    (3.0, 7.0, 1.5)
+]
+
+# Generate fixed X coordinates linearly spaced from start to end
+X_FIXED = np.linspace(START[0], END[0], NUM_WAYPOINTS + 2)
+
+# --- PSO Parameters ---
+NUM_PARTICLES = 40
+MAX_ITERATIONS = 100
+W = 0.5   # Inertia weight
+C1 = 1.5  # Cognitive coefficient
+C2 = 1.5  # Social coefficient
+
+def check_line_circle_collision(p1, p2, obstacle):
+    """Calculates if a line segment between p1 and p2 intersects a circular obstacle."""
+    xc, yc, r = obstacle
+    oc = np.array([xc, yc])
+    
+    # Vector formulations
+    line_vec = p2 - p1
+    len_sq = np.sum(line_vec**2)
+    if len_sq == 0:
+        return np.linalg.norm(p1 - oc) < r
+        
+    # Project center onto the line segment
+    t = max(0, min(1, np.dot(oc - p1, line_vec) / len_sq))
+    projection = p1 + t * line_vec
+    
+    # Return True if closest point on segment is inside the circle radius
+    return np.linalg.norm(projection - oc) < r
+
+def calculate_fitness(y_coordinates):
+    """Calculates path length and adds huge penalties for collisions."""
+    # Reconstruct the full path combining fixed X and variable Y arrays
+    full_y = np.concatenate(([START[1]], y_coordinates, [END[1]]))
+    path = np.column_stack((X_FIXED, full_y))
+    
+    total_length = 0.0
+    penalty = 0.0
+    
+    for i in range(len(path) - 1):
+        p1 = path[i]
+        p2 = path[i+1]
+        
+        # Add Euclidean step distance
+        total_length += np.linalg.norm(p2 - p1)
+        
+        # Check against all obstacles
+        for obs in OBSTACLES:
+            if check_line_circle_collision(p1, p2, obs):
+                penalty += 1000.0  # Massive fitness penalty for intersecting an object
+                
+    return total_length + penalty
+
+# --- Swarm Initialization ---
+# Particles control ONLY the internal Y coordinates
+particle_pos = np.random.uniform(low=0.0, high=10.0, size=(NUM_PARTICLES, NUM_WAYPOINTS))
+particle_vel = np.random.uniform(low=-1.0, high=1.0, size=(NUM_PARTICLES, NUM_WAYPOINTS))
+
+# Set structural tracking states
+pbest_pos = np.copy(particle_pos)
+pbest_fitness = np.array([calculate_fitness(p) for p in particle_pos])
+
+gbest_idx = np.argmin(pbest_fitness)
+gbest_pos = np.copy(pbest_pos[gbest_idx])
+gbest_fitness = pbest_fitness[gbest_idx]
+
+# --- Main PSO Optimization Loop ---
+for iteration in range(MAX_ITERATIONS):
+    for i in range(NUM_PARTICLES):
+        r1 = np.random.rand(NUM_WAYPOINTS)
+        r2 = np.random.rand(NUM_WAYPOINTS)
+        
+        # Standard velocity calculation logic
+        particle_vel[i] = (W * particle_vel[i]) + \
+                           (C1 * r1 * (pbest_pos[i] - particle_pos[i])) + \
+                           (C2 * r2 * (gbest_pos - particle_pos[i]))
+        
+        # Update Position vectors
+        particle_pos[i] += particle_vel[i]
+        
+        # Bound boundaries to keeping robot in the 0-10 window
+        particle_pos[i] = np.clip(particle_pos[i], 0.0, 10.0)
+        
+        # Score current update iteration
+        current_fitness = calculate_fitness(particle_pos[i])
+        
+        # Personal best evaluation checks
+        if current_fitness < pbest_fitness[i]:
+            pbest_pos[i] = np.copy(particle_pos[i])
+            pbest_fitness[i] = current_fitness
+            
+            # Swarm global best checks
+            if current_fitness < gbest_fitness:
+                gbest_pos = np.copy(particle_pos[i])
+                gbest_fitness = current_fitness
+
+# --- Print Results & Plot Visualizations ---
+print(f"Optimal Path Length Found (Including Penalties): {gbest_fitness:.4f}")
+
+# Reconstruct Final Path Coordinates
+final_y = np.concatenate(([START[1]], gbest_pos, [END[1]]))
+final_path = np.column_stack((X_FIXED, final_y))
+
+# Build Plot Window
+plt.figure(figsize=(8, 8))
+ax = plt.gca()
+
+# Draw Obstacles
+for (x_c, y_c, r) in OBSTACLES:
+    circle = plt.Circle((x_c, y_c), r, color='red', alpha=0.4, label='Obstacle')
+    ax.add_patch(circle)
+
+# Plot Start, End, and Optimal Generated Path Vector
+plt.plot(final_path[:, 0], final_path[:, 1], '-o', color='darkblue', linewidth=2.5, label='Optimized Path')
+plt.scatter([START[0], END[0]], [START[1], END[1]], color='green', s=150, zorder=5, label='Start/End Point')
+
+# Setup Labels
+plt.xlim(-1, 11)
+plt.ylim(-1, 11)
+plt.xlabel('X Coordinates')
+plt.ylabel('Y Coordinates')
+plt.title('Robot Path Planning Map Optimization via PSO')
+plt.grid(True, linestyle='--', alpha=0.6)
+
+# Deduplicate legend items labels
+handles, labels = ax.get_legend_handles_labels()
+by_label = dict(zip(labels, handles))
+plt.legend(by_label.values(), by_label.keys(), loc='upper left')
+
+plt.show()
