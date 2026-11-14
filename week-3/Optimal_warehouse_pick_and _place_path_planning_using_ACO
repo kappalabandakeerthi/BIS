@@ -1,0 +1,376 @@
+from collections import deque
+from IPython.display import HTML
+import matplotlib.animation as animation
+from matplotlib.colors import ListedColormap
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+class WarehousePickAndPlaceACO:
+
+  def __init__(
+      self,
+      grid,
+      depot,
+      item_tasks,
+      n_ants=20,
+      n_iterations=100,
+      alpha=1.0,
+      beta=2.5,
+      rho=0.5,
+      q_value=100.0,
+  ):
+    self.grid = grid
+    self.rows, self.cols = grid.shape
+    self.depot = depot
+    self.tasks = item_tasks
+    self.n_items = len(item_tasks)
+    self.n_nodes = self.n_items + 1  # 0 = Depot, 1..N = Items
+
+    self.n_ants = n_ants
+    self.n_iterations = n_iterations
+    self.alpha = alpha
+    self.beta = beta
+    self.rho = rho
+    self.q_value = q_value
+
+    self.cost_matrix = np.zeros((self.n_nodes, self.n_nodes))
+    self.transition_paths = {}
+    self._build_task_graph()
+
+    with np.errstate(divide='ignore'):
+      self.eta = np.divide(
+          1.0,
+          self.cost_matrix,
+          out=np.zeros_like(self.cost_matrix),
+          where=self.cost_matrix != 0,
+      )
+
+    self.pheromone = np.ones((self.n_nodes, self.n_nodes)) * 1.0
+
+  def _bfs_shortest_path(self, start, goal):
+    if start == goal:
+      return list((start,))
+    queue = deque([(start, list((start,)))])
+    visited = {start}
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    while queue:
+      (r, c), path = queue.popleft()
+      if (r, c) == goal:
+        return path
+
+      for dr, dc in directions:
+        nr, nc = r + dr, c + dc
+        if (
+            0 <= nr < self.rows
+            and 0 <= nc < self.cols
+            and self.grid[nr, nc] == 0
+            and (nr, nc) not in visited
+        ):
+          visited.add((nr, nc))
+          queue.append(((nr, nc), path + [(nr, nc)]))
+
+    raise ValueError(f'No walkable path between {start} and {goal}!')
+
+  def _get_node_end_coord(self, node_idx):
+    if node_idx == 0:
+      return self.depot
+    return self.tasks[node_idx - 1]['shelf']
+
+  def _build_task_graph(self):
+    for i in range(self.n_nodes):
+      start_coord = self._get_node_end_coord(i)
+      for j in range(self.n_nodes):
+        if i == j:
+          continue
+        if j == 0:
+          path_to_depot = self._bfs_shortest_path(start_coord, self.depot)
+          self.transition_paths[(i, 0)] = path_to_depot
+          self.cost_matrix[i, 0] = len(path_to_depot) - 1
+        else:
+          pickup_coord = self.tasks[j - 1]['pickup']
+          shelf_coord = self.tasks[j - 1]['shelf']
+
+          path_to_pickup = self._bfs_shortest_path(start_coord, pickup_coord)
+          path_to_shelf = self._bfs_shortest_path(pickup_coord, shelf_coord)
+
+          full_segment = path_to_pickup + path_to_shelf[1:]
+          self.transition_paths[(i, j)] = full_segment
+          self.cost_matrix[i, j] = len(full_segment) - 1
+
+  def _select_next_item(self, current_node, visited):
+    unvisited = list(set(range(1, self.n_nodes)) - set(visited))
+    if not unvisited:
+      return None
+
+    tau = self.pheromone[current_node, unvisited] ** self.alpha
+    eta = self.eta[current_node, unvisited] ** self.beta
+    probabilities = tau * eta
+
+    total = np.sum(probabilities)
+    if total == 0:
+      return np.random.choice(unvisited)
+
+    probabilities /= total
+    return int(np.random.choice(unvisited, p=probabilities))
+
+  def _calculate_tour_steps(self, tour):
+    return int(
+        sum(self.cost_matrix[tour[k], tour[k + 1]] for k in range(len(tour) - 1))
+    )
+
+  def run(self):
+    best_tour = None
+    best_steps = float('inf')
+
+    for _ in range(self.n_iterations):
+      all_tours = []
+      all_steps = []
+
+      for _ in range(self.n_ants):
+        tour = list((0,))  # Start at Depot (0)
+        while len(tour) < self.n_nodes:
+          next_item = self._select_next_item(tour[-1], tour)
+          tour.append(next_item)
+        tour.append(0)  # Return to Depot (0)
+
+        steps = self._calculate_tour_steps(tour)
+        all_tours.append(tour)
+        all_steps.append(steps)
+
+        if steps < best_steps:
+          best_steps = steps
+          best_tour = tour
+
+      self.pheromone *= 1.0 - self.rho
+
+      for tour, steps in zip(all_tours, all_steps):
+        deposit = self.q_value / steps
+        for k in range(len(tour) - 1):
+          u, v = tour[k], tour[k + 1]
+          self.pheromone[u, v] += deposit
+
+    # Reconstruct full step-by-step trajectory
+    full_grid_path = []
+    for k in range(len(best_tour) - 1):
+      segment = self.transition_paths[(best_tour[k], best_tour[k + 1])]
+      if k > 0:
+        segment = segment[1:]
+      full_grid_path.extend(segment)
+
+    return best_tour, best_steps, full_grid_path
+
+
+def animate_warehouse_robot(grid, depot, tasks, best_tour, full_path):
+  """Creates a step-by-step animation compatible with Google Colab."""
+  fig, ax = plt.subplots(figsize=(9, 6))
+  n_rows, n_cols = grid.shape
+  depot_r, depot_c = depot
+
+  # 0 = Walkable aisle (white), 1 = Storage rack (dark slate)
+  cmap = ListedColormap(['#f8fafc', '#334155'])
+  ax.imshow(grid, cmap=cmap)
+
+  ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
+  ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
+  ax.grid(which='minor', color='#cbd5e1', linestyle='-', linewidth=0.8)
+  ax.tick_params(which='minor', bottom=False, left=False)
+  ax.set_xticks(range(n_cols))
+  ax.set_yticks(range(n_rows))
+
+  # Plot Depot
+  ax.scatter(
+      depot_c,
+      depot_r,
+      c='#f59e0b',
+      s=350,
+      marker='s',
+      edgecolors='black',
+      zorder=4,
+      label='Depot',
+  )
+  ax.text(
+      depot_c,
+      depot_r,
+      'D',
+      ha='center',
+      va='center',
+      fontweight='bold',
+      color='black',
+      zorder=5,
+  )
+
+  # Plot Pickups and Assigned Shelves
+  for idx, task in enumerate(tasks, start=1):
+    pr, pc = task['pickup']
+    sr, sc = task['shelf']
+
+    ax.scatter(
+        pc,
+        pr,
+        c='#3b82f6',
+        s=280,
+        marker='o',
+        edgecolors='black',
+        zorder=4,
+        label='Pickup' if idx == 1 else '',
+    )
+    ax.text(
+        pc,
+        pr,
+        f'P{idx}',
+        ha='center',
+        va='center',
+        color='white',
+        fontsize=8,
+        fontweight='bold',
+        zorder=5,
+    )
+
+    ax.scatter(
+        sc,
+        sr,
+        c='#10b981',
+        s=280,
+        marker='D',
+        edgecolors='black',
+        zorder=4,
+        label='Assigned Shelf' if idx == 1 else '',
+    )
+    ax.text(
+        sc,
+        sr,
+        f'S{idx}',
+        ha='center',
+        va='center',
+        color='white',
+        fontsize=8,
+        fontweight='bold',
+        zorder=5,
+    )
+
+  (trail_line,) = ax.plot(
+      [], [], color='#ef4444', linewidth=2.5, alpha=0.65, zorder=3, label='Path'
+  )
+  (robot_dot,) = ax.plot(
+      [],
+      [],
+      marker='o',
+      markersize=14,
+      color='#dc2626',
+      markeredgecolor='yellow',
+      markeredgewidth=2,
+      zorder=6,
+      label='Robot',
+  )
+
+  sequence_str = ' -> '.join(
+      ['Depot'] + [f'Item {i}' for i in best_tour[1:-1]] + ['Depot']
+  )
+  status_text = ax.set_title(
+      f'Sequence: {sequence_str}\nStep: 0', fontsize=10, fontweight='bold'
+  )
+  ax.legend(loc='upper right', bbox_to_anchor=(1.25, 1.0))
+
+  carrying = None
+  placed = set()
+  pickup_map = {t['pickup']: idx for idx, t in enumerate(tasks, start=1)}
+  shelf_map = {t['shelf']: idx for idx, t in enumerate(tasks, start=1)}
+
+  def init():
+    trail_line.set_data([], [])
+    robot_dot.set_data([], [])
+    return trail_line, robot_dot, status_text
+
+  def update(frame):
+    nonlocal carrying
+    if frame == 0:
+      carrying = None
+      placed.clear()
+
+    pos = full_path[frame]
+    curr_r, curr_c = pos
+
+    if carrying is None and pos in pickup_map:
+      item_id = pickup_map[pos]
+      if item_id not in placed:
+        carrying = item_id
+
+    if carrying is not None and pos in shelf_map and shelf_map[pos] == carrying:
+      placed.add(carrying)
+      carrying = None
+
+    ys = [r for r, c in full_path[: frame + 1]]
+    xs = [c for r, c in full_path[: frame + 1]]
+
+    trail_line.set_data(xs, ys)
+    robot_dot.set_data([curr_c], [curr_r])
+
+    state_label = f'Carrying Item {carrying}' if carrying else 'Empty-handed'
+    status_text.set_text(
+        f'Optimal Order: {sequence_str}\n'
+        f'Step {frame}/{len(full_path) - 1} | Status: {state_label} | Placed:'
+        f' {len(placed)}/{len(tasks)}'
+    )
+    return trail_line, robot_dot, status_text
+
+  ani = animation.FuncAnimation(
+      fig,
+      update,
+      frames=len(full_path),
+      init_func=init,
+      interval=300,
+      blit=False,
+      repeat=True,
+  )
+
+  plt.close(fig)
+  return HTML(ani.to_jshtml())
+
+
+# ==========================================
+# Run Simulation + Colab Animation
+# ==========================================
+np.random.seed(42)
+
+# Build 9x12 Warehouse Grid (0 = Walkable Aisle, 1 = Storage Rack)
+warehouse_grid = np.zeros((9, 12), dtype=int)
+warehouse_grid[1:4, 1:3] = 1
+warehouse_grid[1:4, 4:6] = 1
+warehouse_grid[1:4, 7:9] = 1
+warehouse_grid[1:4, 10:11] = 1
+warehouse_grid[5:8, 1:3] = 1
+warehouse_grid[5:8, 4:6] = 1
+warehouse_grid[5:8, 7:9] = 1
+warehouse_grid[5:8, 10:11] = 1
+
+robot_depot = (0, 0)
+
+items = [
+    {'name': 'Item 1', 'pickup': (1, 0), 'shelf': (6, 9)},
+    {'name': 'Item 2', 'pickup': (7, 9), 'shelf': (2, 6)},
+    {'name': 'Item 3', 'pickup': (1, 6), 'shelf': (7, 3)},
+    {'name': 'Item 4', 'pickup': (8, 3), 'shelf': (1, 9)},
+]
+
+solver = WarehousePickAndPlaceACO(
+    grid=warehouse_grid,
+    depot=robot_depot,
+    item_tasks=items,
+    n_ants=20,
+    n_iterations=100,
+)
+
+best_order, total_steps, grid_path = solver.run()
+
+print('Optimal Order:', best_order)
+print('Total Steps:', total_steps)
+print('\nFinal Pheromone Matrix (5x5):')
+print(np.round(solver.pheromone, 2))
+
+# Render interactive animation in Colab
+html_anim = animate_warehouse_robot(
+    warehouse_grid, robot_depot, items, best_order, grid_path
+)
+display(html_anim)
